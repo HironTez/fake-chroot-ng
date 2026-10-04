@@ -1984,7 +1984,7 @@ static int link_src_ro(long fd, const char *srch, int by_fd, int followed) {
  * its links apart from the group's. */
 static int link_src_l2s(const char *srch) {
     char st[STAT_BUF_SIZE];
-    return cng_g_l2s && cng_l2s_stat(srch, st) == 1;
+    return cng_g_l2s && (cng_l2s_stat(srch, st) == 1 || cng_l2s_member_like(srch));
 }
 
 /* What the kernel's filename_create says of a link's new name before the
@@ -4458,8 +4458,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             long n = cng_user_strcopyin(b1, (const char *)a0, sizeof b1);
             if (n < 0)
                 return n == -E2BIG ? -ENAMETOOLONG : n;
-            const char *tb = strrchr(b1, '/');
-            if (cng_l2s_hidden(tb ? tb + 1 : b1)) {
+            if (cng_l2s_text_denied(b1)) {
                 if (cng_g_debug)
                     cng_dprintf(2, "[cng] l2s deny nr=%ld (target %s)\n", nr,
                                 b1);

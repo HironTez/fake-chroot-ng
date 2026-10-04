@@ -116,6 +116,7 @@ if [ -f tests/m17_workdir.sh ]; then . tests/m17_workdir.sh; fi
 if [ -f tests/m18_ptrace.sh ]; then . tests/m18_ptrace.sh; fi
 if [ -f tests/m19_scripts.sh ]; then . tests/m19_scripts.sh; fi
 if [ -f tests/m20_sysvipc.sh ]; then . tests/m20_sysvipc.sh; fi
+if [ -f tests/m21_l2s_proot.sh ]; then . tests/m21_l2s_proot.sh; fi
 if [ -f tests/m23_execmap.sh ]; then . tests/m23_execmap.sh; fi
 if [ -f tests/m24_openat2.sh ]; then . tests/m24_openat2.sh; fi
 if [ -f tests/m25_fdview.sh ]; then . tests/m25_fdview.sh; fi

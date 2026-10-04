@@ -4484,6 +4484,47 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                      0);
     }
 
+    /* The first link renames the file onto ".l2s.<ino>" in the store, and a
+     * rename replaces what stands there. In a store proot has used a name can
+     * be taken: its indirection ".l2s.<name><NNNN>" is ".l2s.<ino>" for a file
+     * called "12" and a four-digit counter. A name taken is a store that
+     * cannot hold the group: it lives beside its first name instead, and what
+     * stood on the name is as it was. */
+    {
+        long fc = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/cl_a",
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (fc >= 0) {
+            sys_write((int)fc, "cl", 2);
+            sys_close((int)fc);
+        }
+        char sc[144], sc2[144], squat[CNG_PATH_MAX], cw[CNG_PATH_MAX];
+        long rc0 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cl_a",
+                                (long)sc, 0, 0, 0, 0);
+        dbg_mkpath(squat, sizeof squat, rootfs, "/.l2s/.l2s.", rc0 == 0 ? ST_INO(sc) : 0, 1);
+        dbg_mkpath(cw, sizeof cw, rootfs, "/w", 0, 0);
+        CNG_SYS(__NR_symlinkat, "squatter", CNG_AT_FDCWD, squat, 0, 0, 0);
+        long cl = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/cl_a",
+                               CNG_AT_FDCWD, (long)"/w/cl_b", 0, 0, 0);
+        char ctx[32] = {0};
+        long tn = CNG_SYS(__NR_readlinkat, CNG_AT_FDCWD, squat, ctx,
+                          sizeof ctx - 1, 0, 0);
+        int cl_kept = (tn == 8 && !strcmp(ctx, "squatter"));
+        long ra3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cl_a",
+                                (long)sc, 0, 0, 0, 0);
+        long rb3 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/cl_b",
+                                (long)sc2, 0, 0, 0, 0);
+        int cl_group = (cl == 0 && ra3 == 0 && rb3 == 0 && ST_ISREG(sc) &&
+                        ST_NLINK(sc) == 2 && ST_INO(sc) == ST_INO(sc2));
+        int cl_beside = (dbg_has_l2s(cw) == 1);
+        int ok_cl = cl_kept && cl_group && cl_beside;
+        cng_dprintf(1, "l2s-collide: kept=%d group=%d beside=%d -> %s\n",
+                    cl_kept, cl_group, cl_beside, ok_cl ? "OK" : "FAIL");
+        fails += !ok_cl;
+        CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, squat, 0, 0, 0, 0);
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cl_a", 0, 0, 0, 0, 0);
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/cl_b", 0, 0, 0, 0, 0);
+    }
+
     /* Two names of one file: rename(2) does nothing and both stay. On a group
      * the destination used to be replaced by the source and the count lowered,
      * which left the one name the guest had asked to move the file to. A

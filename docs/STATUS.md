@@ -3720,6 +3720,67 @@ vfork/`posix_spawn` child-stack handling.
   - Not covered: the name of a file is absent for the moment between a first
     link's rename and its symlink, to any other call than `link`.
 
+- [x] **M82 — rootfs trees made by proot-distro: proot's link2symlink groups**
+  A rootfs installed through proot holds its hardlinks as proot wrote them, a
+  scheme this one did not know: every member showed as a dangling symlink (its
+  text is an absolute HOST path, re-rooted at the guest root), so `cat`, `ls`
+  and exec of anything hardlinked failed — coreutils is one binary and over a
+  hundred such links in current Ubuntu images — and `rm` never lowered a count.
+  Ported from arm64chroot, which reads and keeps them.
+  - The layout: a member holds the host path of an indirection symlink
+    `<rootfs>/.l2s/.l2s.<name><NNNN>` (also `.proot.l2s.`), which names the data
+    file `….<CCCC>` beside it, whose last four digits are the live count (a
+    name added or removed renames the data file and re-points the indirection).
+  - A symlink is a member only if the whole chain checks out (`pr_locate`):
+    its text is a canonical absolute path to such a name that names a place of
+    this rootfs — under it, or the `.l2s` store of the rootfs it was moved or
+    copied from, which is read as this one's; that path, resolved as a *guest*
+    path through the containment walk (so binds and a symlinked `.l2s` work and
+    a `..` cannot climb out), is a symlink whose text is in the same directory
+    and names `<ind>.<NNNN>`, which is a regular file there. Anything else is an
+    ordinary symlink. Nothing the text says is opened as a string.
+  - Every recognition site goes through `cng_l2s_resolve`, so stat/statx/fstat
+    (the count is `st_nlink`), `readlink` (EINVAL), the no-follow calls, exec
+    (`/proc/self/exe` keeps the member's name), listings (`DT_REG`) and the
+    `:ro` rules follow. The guest resolver maps the host paths in a member's
+    and an indirection's text back to guest paths (`cng_l2s_untranslate_target`).
+  - Kept with proot's own bookkeeping: `link` raises the count and makes a name
+    with the same text (a failure leaves a count too high, never too low),
+    `unlink` and a rename over a name lower it, and the last name removes the
+    data and the indirection. 0000 is one name; 9999 takes no more (`EMLINK`).
+    A count change is two renames, so every change runs under the store lock
+    and a reader that finds the chain cut waits for it; a chain left cut by a
+    killed process is made whole by the next change (`pr_repair`), and a link
+    that looks like a member is never handed to the host's `link(2)` or copied
+    (a name nothing counted, and its unlink a count nobody raised, would delete
+    the data from under the names that are left). A new name under a read-only
+    l2s directory is `EXDEV`/`EROFS` like any other, a removed name still goes
+    with the count left alone. New groups are still made in this scheme.
+  - A guest may not write an absolute symlink text ending in a proot name
+    (`ENOENT`, as for ours): it would be counted into a group it never was.
+  - Found on the way: the first link's rename replaced whatever stood on
+    `.l2s.<ino>` in the store, and a proot indirection can (a file called "12"
+    and a four-digit counter); a name taken now sends the group beside its
+    first name. A proot name made of digits has the shape of our data file and
+    marker; they are told apart by type (ours is a regular file, proot's
+    indirection a symlink).
+  - Tests: `tests/m21_l2s_proot.sh` — `tests/guests/l2sproot.c` run over real
+    hardlinks on a kernel (`l2sproot.expect`) and over a layout laid down by
+    hand as proot's is (the same bytes, and the l2s directory left as proot
+    would leave it, also through a symlinked and a copied rootfs), then hostile
+    layouts judged by `tests/guests/l2sprobe.c` against an ordinary symlink's
+    answers and canaries outside the rootfs: a `..` climb, a sibling sharing the
+    rootfs's name as a prefix, chains that do not check out, loops, counts 0000
+    and 9999, the l2s directory on a read-only and a writable bind and as a
+    symlink inside and outside, a chain cut by a killed process, names made of
+    digits, and six processes adding and removing names at once. `-t l2stest`
+    `l2s-collide`.
+  - Not covered: a stat, open or exec of one name of a group while another
+    process changes the count of the same group can fail for the length of the
+    two renames (the stat family looks again; the no-follow calls do not).
+    `stat` of a symlink loop answers the link, not `ELOOP` — an ordinary
+    symlink does too, and is not specific to groups.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes

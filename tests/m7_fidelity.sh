@@ -187,6 +187,10 @@ check_contains "l2s reads a group's count from its own marker only" \
 # that was planted from outside is not copied into another directory.
 check_contains "l2s links an ordinary symlink as a second symlink of its text" \
     "l2s-symlink: rel=1 abs=1 outside=1 dangling=1 read=1 refused=1 -> OK" "$out"
+# The first link's rename replaces what stands on the name in the store, and a
+# proot-made store can have a name there: it is left as it was.
+check_contains "l2s first link leaves a name already in the store alone" \
+    "l2s-collide: kept=1 group=1 beside=1 -> OK" "$out"
 # rename(2) of one name of a file onto another name of it does nothing. On a
 # group it replaced the destination with the source and lowered the count.
 check_contains "l2s rename between two names of one group keeps both" \

@@ -25,6 +25,14 @@
  * have written — in a place of the guest's own, or a stale store path — and
  * the guest cannot write a target in the ".l2s." grammar itself (l2s.c).
  *
+ * Groups made by proot (proot-distro's rootfs trees) are read, presented and
+ * kept as proot keeps them, so a rootfs can move between the two: a name is a
+ * symlink holding the host path of an indirection symlink in the l2s directory
+ * ("<rootfs>/.l2s/.l2s.<name><NNNN>"), which names the data file beside it
+ * ("….<CCCC>"), whose last four digits are the live count. New groups are
+ * still made in the scheme above. See "proot's groups" in l2s.c for what makes
+ * a symlink a member of one.
+ *
  * stat/statx on any of the names is redirected to the data file, with st_nlink
  * overridden to the marker count, so the group presents as ordinary regular
  * files sharing one inode (matching st_ino, shared contents) — which is what
@@ -90,6 +98,20 @@ int cng_l2s_statx(const char *host, void *statxbuf, unsigned mask,
  * statx, advertise STATX_NLINK) in the buffer. */
 void cng_l2s_fix_fd(long fd, void *statbuf);
 void cng_l2s_fix_fd_statx(long fd, void *statxbuf);
+
+/* 1 if `host` is a link of a proot group: its chain checks out, or is cut at
+ * the moment (a count change is two renames, one can be under way or have been
+ * killed half way). Such a link is never handed to the host's link(2): that
+ * would be a name nothing counted. The emulation links it. An ordinary symlink
+ * that only looks like a member is not, and is linked like any other. */
+int cng_l2s_member_like(const char *host);
+
+/* A symlink target the guest may not write: one that would be taken for a
+ * link of the emulation's — a last component in our ".l2s." grammar, or an
+ * absolute path ending in a name of proot's (".l2s.<name><NNNN>[.<CCCC>]",
+ * also ".proot.l2s."). Such a text names the machinery, and a guest link
+ * carrying it would be counted into a group it was never counted into. */
+int cng_l2s_text_denied(const char *tgt);
 
 /* True for any hidden l2s file (data or marker) basename — used to hide them
  * from the guest's directory listings, and to refuse a guest symlink whose
