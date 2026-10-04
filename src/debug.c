@@ -4484,6 +4484,78 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                      0);
     }
 
+    /* Two names of one file: rename(2) does nothing and both stay. On a group
+     * the destination used to be replaced by the source and the count lowered,
+     * which left the one name the guest had asked to move the file to. A
+     * rename onto a name of another group still lowers that group. */
+    {
+        long fa = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (fa >= 0) {
+            sys_write((int)fa, "ss", 2);
+            sys_close((int)fa);
+        }
+        fa = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sf_c",
+                          CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (fa >= 0) {
+            sys_write((int)fa, "cc", 2);
+            sys_close((int)fa);
+        }
+        cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sf_a", CNG_AT_FDCWD,
+                     (long)"/w/sf_b", 0, 0, 0);
+        cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sf_c", CNG_AT_FDCWD,
+                     (long)"/w/sf_d", 0, 0, 0);
+        char xa[144], xb[144];
+        long r1 = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                               CNG_AT_FDCWD, (long)"/w/sf_b", 0, 0, 0);
+        long r2 = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/sf_b",
+                               CNG_AT_FDCWD, (long)"/w/sf_a", 0, 0, 0);
+        long r3 = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/sf_a",
+                               CNG_AT_FDCWD, (long)"/w/sf_b", 0, 0, 0);
+        long ra2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                                (long)xa, 0, 0, 0, 0);
+        long rb2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_b",
+                                (long)xb, 0, 0, 0, 0);
+        int sf_stay = (r1 == 0 && r2 == 0 && r3 == 0 && ra2 == 0 && rb2 == 0 &&
+                       ST_NLINK(xa) == 2 && ST_NLINK(xb) == 2 &&
+                       ST_INO(xa) == ST_INO(xb));
+        /* NOREPLACE is the kernel's EEXIST, and a name with a slash after it
+         * is judged as the kernel judges it: not a rename of that name. */
+        long r4 = cng_dispatch(__NR_renameat2, CNG_AT_FDCWD, (long)"/w/sf_a",
+                               CNG_AT_FDCWD, (long)"/w/sf_b",
+                               CNG_RENAME_NOREPLACE, 0, 0);
+        long r5 = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                               CNG_AT_FDCWD, (long)"/w/sf_b/", 0, 0, 0);
+        ra2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                           (long)xa, 0, 0, 0, 0);
+        rb2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_b",
+                           (long)xb, 0, 0, 0, 0);
+        int sf_judged = (r4 == -EEXIST && r5 != 0 && ra2 == 0 && rb2 == 0 &&
+                         ST_NLINK(xa) == 2 && ST_NLINK(xb) == 2);
+        /* Another group's name over one of this: that group loses a name. */
+        long r6 = cng_dispatch(__NR_renameat, CNG_AT_FDCWD, (long)"/w/sf_c",
+                               CNG_AT_FDCWD, (long)"/w/sf_b", 0, 0, 0);
+        char xd[144];
+        ra2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_a",
+                           (long)xa, 0, 0, 0, 0);
+        rb2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_b",
+                           (long)xb, 0, 0, 0, 0);
+        long rd2 = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sf_d",
+                                (long)xd, 0, 0, 0, 0);
+        int sf_other = (r6 == 0 && ra2 == 0 && rb2 == 0 && rd2 == 0 &&
+                        ST_NLINK(xa) == 1 && ST_NLINK(xb) == 2 &&
+                        ST_NLINK(xd) == 2 && ST_INO(xb) == ST_INO(xd) &&
+                        ST_INO(xa) != ST_INO(xb));
+        int ok_sf = sf_stay && sf_judged && sf_other;
+        cng_dprintf(1, "l2s-samefile: stay=%d judged=%d other=%d -> %s\n",
+                    sf_stay, sf_judged, sf_other, ok_sf ? "OK" : "FAIL");
+        fails += !ok_sf;
+        const char *sfu[] = {"/w/sf_a", "/w/sf_b", "/w/sf_d"};
+        for (int i = 0; i < 3; i++)
+            cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)sfu[i], 0, 0, 0, 0,
+                         0);
+    }
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

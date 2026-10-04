@@ -4660,8 +4660,24 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             if (cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1)
                 dec = 1;
             char hnf[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
+            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0) {
+                /* Two names of one file: rename(2) does nothing and succeeds,
+                 * and both names stay (a no-op is judged before permissions,
+                 * and RENAME_NOREPLACE's EEXIST before it: only a plain
+                 * rename is answered here). On a group it replaced the
+                 * destination with the source and lowered the count, so the
+                 * file was left with the one name the guest had asked to move
+                 * it to. A name with a slash after it is the kernel's to
+                 * judge (ENOTDIR for a file), not a rename of the name. */
+                char sdata[CNG_PATH_MAX];
+                size_t ol = strlen(op), nl = strlen(np);
+                if (dec && (nr == __NR_renameat || !(int)a4) &&
+                    !(ol && op[ol - 1] == '/') && !(nl && np[nl - 1] == '/') &&
+                    cng_l2s_resolve(hnf, sdata, sizeof sdata, 0) == 1 &&
+                    !strcmp(sdata, data))
+                    return 0;
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
+            }
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
         if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))

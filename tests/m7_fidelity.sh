@@ -187,6 +187,10 @@ check_contains "l2s reads a group's count from its own marker only" \
 # that was planted from outside is not copied into another directory.
 check_contains "l2s links an ordinary symlink as a second symlink of its text" \
     "l2s-symlink: rel=1 abs=1 outside=1 dangling=1 read=1 refused=1 -> OK" "$out"
+# rename(2) of one name of a file onto another name of it does nothing. On a
+# group it replaced the destination with the source and lowered the count.
+check_contains "l2s rename between two names of one group keeps both" \
+    "l2s-samefile: stay=1 judged=1 other=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

@@ -118,6 +118,15 @@ if [ "$m10_ready" -eq 1 ]; then
          [ -L sl2 ] && [ -L as2 ] && [ -L dg2 ] && [ -L s2 ] && echo all-symlinks;
          rm sl; cat sl2; rm sl2 as2; ls'
 
+    # rename(2) of one name of a file onto another name of it does nothing:
+    # both stay. On a group it replaced the destination and lowered the count.
+    l2s_diff "mv between two names of one file does nothing" \
+        'cd /tmp; echo hi>a; ln a b; mv a b; echo rc=$?; ls; stat -c %h a b;
+         cat a b'
+    l2s_diff "mv onto a name of another file lowers that file's count" \
+        'cd /tmp; echo x>a; ln a b; echo y>c; ln c d; mv c b; echo rc=$?; ls;
+         stat -c %h a b d; cat a b d'
+
     # A group whose data file cannot be opened. The marker update used to be
     # serialized by an flock on the data file itself, opened for reading, so a
     # mode 0000 or 0200 file — which packages do ship — ran the update

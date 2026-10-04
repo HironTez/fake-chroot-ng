@@ -3681,6 +3681,45 @@ vfork/`posix_spawn` child-stack handling.
     m27 runs outside the monitor, and only the forced rows are judged where it
     says `broken`.
 
+- [x] **M81 — l2s: the first link of a file lost it under a race; a link of a
+  symlink was ELOOP; a link of a FIFO hung**
+  Found by comparing the emulation with arm64chroot's, which keeps a count that
+  errs high where this one lost the data.
+  - The first link of a file took no lock (every later one did). Two processes
+    making it together both saw a plain file; the second's `rename` put the
+    first's new symlink on the data file, which was then a symlink to itself
+    with the contents gone ("Symbolic link loop" from every name). `cng_l2s_link`
+    is now classify (`l2s_link_source`) → lock → classify again → act, so the
+    second finds the group the first made and joins it. The look is one
+    `lstat` first and `cng_l2s_resolve` only for a symlink: asking in the other
+    order took a name that became a group's link in between for an ordinary
+    symlink. An `ENOENT` is confirmed under the lock too (a first link has a
+    moment with no such name). Copies run outside the lock, which is the
+    whole rootfs's. Where the store is unusable the lock is the data's
+    directory (tried before the data file, which a first link cannot have
+    locked), so a first link and the group it makes share one lock.
+  - `link(2)` of an ordinary symlink is a second symlink with the same text
+    (arm64chroot's answer too); nothing it names is opened. It was ELOOP,
+    since the copy fallback's open does not follow a last component. A text in
+    the `.l2s.` grammar is refused (`EPERM`): carried into a directory with a
+    data file by that name it would join a group it was never counted into.
+    `/proc` magic links stay on the copy path. The two names are not one
+    inode, so the symlinks' `st_nlink` is 1.
+  - A directory, FIFO, device or socket source is `EPERM` without being
+    opened; `ln fifo fifo2` waited for a writer for good. The copy's open is
+    also `O_NONBLOCK|O_NOCTTY`.
+  - `rename` of one name of a group onto another name of the same group does
+    nothing and succeeds, as `rename(2)` does for two names of one file. It
+    replaced the destination and lowered the count, leaving one name. Only a
+    plain rename: `RENAME_NOREPLACE` stays `EEXIST`, a trailing slash stays the
+    kernel's call.
+  - Tests: `-t l2stest` `l2s-symlink`, `l2s-samefile`; m10 differential legs
+    for symlink links and both `mv` cases, a FIFO leg, and `tests/guests/l2srace.c`
+    (16 processes released together at each of 40 fresh files, with the store
+    and with a plain file squatting on it): the previous build fails them.
+  - Not covered: the name of a file is absent for the moment between a first
+    link's rename and its symlink, to any other call than `link`.
+
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 
 ## Testing notes
