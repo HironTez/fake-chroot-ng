@@ -52,7 +52,12 @@ extern int cng_g_l2s;
 extern int cng_g_l2s_force;
 
 /* Emulate link(src, dst) (host paths) via the backing-file symlink scheme.
- * Returns 0 or -errno. */
+ * Returns 0 or -errno. A group's state (marker, the data's place in the store)
+ * is changed under the store lock, the first link of a file included, and the
+ * source is judged again once the lock is held. An ordinary symlink is linked
+ * as a second symlink of the same text, a directory, FIFO, device or socket is
+ * EPERM (nothing opens them), and only a source the guest has no name for (a
+ * descriptor's /proc link) is copied. */
 int cng_l2s_link(const char *src, const char *dst);
 
 /* If `host` is one of our l2s symlinks, fill `data` with its backing-file path

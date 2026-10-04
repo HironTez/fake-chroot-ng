@@ -324,11 +324,16 @@ static int l2s_store_dir(char *out, size_t sz);
  * behind. The lock is now a file of our own in the store, ".l2s/.lock" under
  * the rootfs, created 0600 in a directory we made 0700: openable by us
  * whatever mode the group's own files carry, and one lock per rootfs is the
- * right scope, since that is what the store is. The data file (either way it
- * can be opened) and then its directory stand in only where the store cannot
- * be had at all — a rootfs on which nothing can be created, where no link is
- * going to be made either. Proceeding unlocked is the last resort and is
- * logged, since it is the one outcome the scheme's counts cannot survive. */
+ * right scope, since that is what the store is. The directory of the data file
+ * (and, should that not open, the file itself) stands in only where the store
+ * cannot be had at all — a rootfs whose root nothing can be created in, so that
+ * a group lives beside its first name instead. `data` need not exist: the first
+ * link of a file takes this lock before its data file does, with the name that
+ * file is about to get, and the directory is the one thing that name and the
+ * group it becomes have in common — which is why the directory is tried before
+ * the file, whose lock the first link could not have taken. Proceeding unlocked
+ * is the last resort and is logged, since it is the one outcome the scheme's
+ * counts cannot survive. */
 static long l2s_lock(const char *data) {
     char lk[CNG_PATH_MAX];
     long fd = -1;
@@ -340,15 +345,15 @@ static long l2s_lock(const char *data) {
                               0600);
         }
     }
-    if (fd < 0)
-        fd = cng_pin_open(data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
-    if (fd < 0)
-        fd = cng_pin_open(data, CNG_O_WRONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
         l2s_dirname(data, lk, sizeof lk);
         fd = cng_pin_open(lk, CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
                           0);
     }
+    if (fd < 0)
+        fd = cng_pin_open(data, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        fd = cng_pin_open(data, CNG_O_WRONLY | CNG_O_CLOEXEC, 0);
     if (fd < 0) {
         L2S_LOG("[cng] l2s: no lock to be had for %s (%ld): unlocked update\n",
                 data, fd);
@@ -623,9 +628,14 @@ static int l2s_target(const char *host, char *data, size_t dsz,
 
 /* Copy the contents of `src` (opened, follows /proc/self/fd/N) into a new
  * regular file `dst`. Used when src has no named regular inode to symlink to
- * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories. */
+ * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories.
+ * The open must not wait for anything: a FIFO opened for reading blocks until
+ * a writer turns up, and one swapped in for the file after it was judged
+ * regular would leave the guest's call hanging for good. O_NONBLOCK makes the
+ * open return, and the fstat below then refuses what is not a regular file. */
 static int l2s_materialize(const char *src, const char *dst) {
-    long in = cng_pin_open(src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    long in = cng_pin_open(
+        src, CNG_O_RDONLY | CNG_O_NONBLOCK | CNG_O_NOCTTY | CNG_O_CLOEXEC, 0);
     if (in < 0)
         return (int)in;
     /* A real hardlink shares the source's mode; the copy must too (apk
@@ -673,83 +683,144 @@ static int l2s_materialize(const char *src, const char *dst) {
     return (int)rc;
 }
 
-int cng_l2s_link(const char *src, const char *dst) {
+/* ---- link --------------------------------------------------------------- */
+
+/* What the source of a link is, to the emulation. */
+enum {
+    LSRC_GROUP = 1, /* a name of a group in either format, or its data file */
+    LSRC_FILE,      /* a regular file of the guest's own: its first link */
+    LSRC_SYMLINK,   /* an ordinary symlink of the guest's own */
+    LSRC_COPY,      /* nothing of the guest's to point at: linked by copy */
+};
+
+/* Classify `src`: one of the above, or -errno. For a group, `data` is the data
+ * file's path, *count the live count (0 if the marker is lost) and *ino the
+ * group's number; for a first link *ino is the file's own inode.
+ *
+ * `own`: a place of the guest's own. A source outside every one — the file
+ * behind a descriptor it was handed, linked by AT_EMPTY_PATH — is never
+ * renamed into the store or given a marker beside it: that would move a file,
+ * and write a directory, that no name of the guest's reaches. Its contents are
+ * copied instead, as for a file with no name at all.
+ *
+ * What the answer is about is a moment, so a caller that is going to act on a
+ * group, or make one, asks again once it holds the lock (cng_l2s_link). */
+static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
+                           unsigned long *count, unsigned long long *ino) {
     char st[ST_SIZE];
-    if (l2s_lstat(dst, st) == 0)
-        return -EEXIST; /* link(2): dst must not exist */
-
-    char data[CNG_PATH_MAX], sdir[CNG_PATH_MAX], ddir[CNG_PATH_MAX];
-    unsigned long count = 0;
-    unsigned long long ino;
-
-    l2s_dirname(dst, ddir, sizeof ddir);
-
-    int isl = cng_l2s_resolve(src, data, sizeof data, &count);
-    if (isl < 0) {
-        L2S_LOG("[cng] l2s: src probe %s -> %d\n", src, isl);
-        return isl;
-    }
-    /* A source outside every place of the guest's own — the file behind a
-     * descriptor it was handed, linked by AT_EMPTY_PATH — is never renamed
-     * into the store or given a marker beside it: that would move a file,
-     * and write a directory, that no name of the guest's reaches. Its
-     * contents are copied instead, as for a file with no name at all. */
-    int own = l2s_canonical(src) && l2s_owned(src);
-    /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
-    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_reg(st) &&
-        parse_data_exact(l2s_basename(src), &ino)) {
-        cng_strlcpy(data, src, sizeof data);
-        l2s_dirname(src, sdir, sizeof sdir);
-        if (find_marker(sdir, ino, &count) != 0)
-            count = 0;
-        isl = 1;
-    }
-
-    if (isl == 1) {
-        /* Existing group (either format): bump the marker beside the data,
-         * then point dst at it — same-directory relative target when dst sits
-         * beside the data (the legacy look), absolute host path otherwise
-         * (how names in other directories join a group). */
-        parse_data(l2s_basename(data), &ino);
-        l2s_dirname(data, sdir, sizeof sdir);
-        long lk = l2s_lock(data);
-        if (lk >= 0 && find_marker(sdir, ino, &count) != 0)
-            count = 0; /* re-read under the lock */
-        char newm[CNG_PATH_MAX], oldm[CNG_PATH_MAX];
-        unsigned long nc = (count ? count : 1) + 1;
-        if (build_name(newm, sizeof newm, sdir, ino, (long)nc) < 0) {
-            l2s_unlock(lk);
-            return -ENAMETOOLONG;
-        }
-        int bumped = 0;
-        if (count && build_name(oldm, sizeof oldm, sdir, ino, (long)count) == 0)
-            bumped = (l2s_rename(oldm, newm) == 0);
-        if (!bumped)
-            l2s_touch(newm); /* marker lost: recreate at the new count */
-        long sr = strcmp(sdir, ddir) == 0
-                      ? l2s_symlink(l2s_basename(data), dst)
-                      : l2s_symlink(data, dst);
-        if (sr < 0) { /* roll the bump back */
-            L2S_LOG("[cng] l2s: group dst symlink %s -> %d\n", dst, (int)sr);
-            if (bumped)
-                l2s_rename(newm, oldm);
-            else
-                l2s_unlink(newm);
-            l2s_unlock(lk);
-            return (int)sr;
-        }
-        l2s_unlock(lk);
-        return 0;
-    }
-
-    /* First link for a real file. */
+    *count = 0;
+    /* The name is looked at once, and what it is decides what is asked next:
+     * only a symlink can be a name of a group, so only a symlink is asked
+     * (cng_l2s_resolve looks again, and a name that was a regular file when
+     * asked and a group's link by the time it was looked at was taken for an
+     * ordinary symlink, whose text the copy below refuses). A symlink that is
+     * not a group's does not become one, nor a group's one an ordinary
+     * symlink, so the answer for a symlink holds. */
     if (l2s_lstat(src, st) < 0) {
         L2S_LOG("[cng] l2s: src %s missing\n", src);
         return -ENOENT;
     }
-    if (!is_reg(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
-        return l2s_materialize(src, dst);
-    ino = *(unsigned long long *)((char *)st + ST_INO_OFF);
+    if (is_lnk(st)) {
+        int isl = cng_l2s_resolve(src, data, dsz, count);
+        if (isl < 0) {
+            L2S_LOG("[cng] l2s: src probe %s -> %d\n", src, isl);
+            return isl;
+        }
+        if (isl == 1) {
+            parse_data(l2s_basename(data), ino);
+            return LSRC_GROUP;
+        }
+        return own ? LSRC_SYMLINK : LSRC_COPY; /* /proc/self/fd/N: a copy */
+    }
+    if (!own)
+        return LSRC_COPY;
+    /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
+    if (is_reg(st) && parse_data_exact(l2s_basename(src), ino)) {
+        char dir[CNG_PATH_MAX];
+        if (cng_strlcpy(data, src, dsz) >= dsz)
+            return -ENAMETOOLONG;
+        l2s_dirname(src, dir, sizeof dir);
+        if (find_marker(dir, *ino, count) != 0)
+            *count = 0;
+        return LSRC_GROUP;
+    }
+    if (!is_reg(st))
+        return -EPERM; /* a directory, FIFO, device or socket: nothing here
+                        * can stand for a second name of one, and opening it
+                        * to copy it could block for good (a FIFO) */
+    memcpy(ino, st + ST_INO_OFF, sizeof *ino);
+    return LSRC_FILE;
+}
+
+/* link(2) of an ordinary symlink makes a second name of the symlink itself,
+ * which a second symlink with the same text is: the text is resolved from
+ * where the name sits, as a kernel resolves it, and nothing it names is
+ * opened. Copying what it names was this fallback's answer for anything that
+ * was not a regular file — an ELOOP, since the open does not follow a last
+ * component, and had it followed one, the host's file where the text is an
+ * absolute path of the guest's.
+ *
+ * Only the text is the emulation's concern. One whose last component is in
+ * the ".l2s." grammar is not copied: a link of ours is recognized by its
+ * target (see l2s_locate), the guest may not write such a text (symlinkat),
+ * and carried into the directory of a group's data, a copy of one planted
+ * from outside would become a member of a group it was never counted into. */
+static int l2s_link_symlink(const char *src, const char *dst) {
+    char tgt[CNG_PATH_MAX];
+    long n = l2s_readlink(src, tgt, sizeof tgt - 1);
+    if (n < 0)
+        return (int)n;
+    tgt[n] = '\0';
+    if (cng_l2s_hidden(l2s_basename(tgt))) {
+        L2S_LOG("[cng] l2s: symlink %s names the machinery (%s)\n", src, tgt);
+        return -EPERM;
+    }
+    return (int)l2s_symlink(tgt, dst);
+}
+
+/* Another name for an existing group (either format): bump the marker beside
+ * the data, then point dst at it — a same-directory relative target when dst
+ * sits beside the data (the legacy look), the absolute host path otherwise
+ * (how names in other directories join a group). The caller holds the lock,
+ * and `count` was read under it. */
+static int l2s_link_group(const char *data, unsigned long long ino,
+                          unsigned long count, const char *dst,
+                          const char *ddir) {
+    char sdir[CNG_PATH_MAX], newm[CNG_PATH_MAX], oldm[CNG_PATH_MAX];
+    l2s_dirname(data, sdir, sizeof sdir);
+    unsigned long nc = (count ? count : 1) + 1;
+    if (build_name(newm, sizeof newm, sdir, ino, (long)nc) < 0)
+        return -ENAMETOOLONG;
+    int bumped = 0;
+    if (count && build_name(oldm, sizeof oldm, sdir, ino, (long)count) == 0)
+        bumped = (l2s_rename(oldm, newm) == 0);
+    if (!bumped)
+        l2s_touch(newm); /* marker lost: recreate at the new count */
+    long sr = strcmp(sdir, ddir) == 0 ? l2s_symlink(l2s_basename(data), dst)
+                                      : l2s_symlink(data, dst);
+    if (sr < 0) { /* roll the bump back */
+        L2S_LOG("[cng] l2s: group dst symlink %s -> %d\n", dst, (int)sr);
+        if (bumped)
+            l2s_rename(newm, oldm);
+        else
+            l2s_unlink(newm);
+        return (int)sr;
+    }
+    return 0;
+}
+
+/* Returned by l2s_link_first for a file that can be linked only by copying. */
+#define L2S_COPY 1
+
+/* The first link of a regular file: it becomes the data of a new group and
+ * both names symlinks to it. The caller holds the lock, and has just seen `src`
+ * to be that regular file, of inode `ino` — which is what keeps this from
+ * moving a file already moved: a rename of a name that has meanwhile become a
+ * link of this group would put the link itself where the data is, a symlink
+ * to itself. Returns 0, -errno, or L2S_COPY. */
+static int l2s_link_first(const char *src, const char *dst,
+                          unsigned long long ino, const char *ddir) {
+    char data[CNG_PATH_MAX], sdir[CNG_PATH_MAX];
 
     /* Prefer the central store: the group's names then carry the data file's
      * absolute host path, so they work across directories and keep working
@@ -795,7 +866,7 @@ int cng_l2s_link(const char *src, const char *dst) {
      * then still degrades to an independent copy. */
     l2s_dirname(src, sdir, sizeof sdir);
     if (strcmp(sdir, ddir) != 0)
-        return l2s_materialize(src, dst);
+        return L2S_COPY;
     if (build_name(data, sizeof data, sdir, ino, -1) < 0)
         return -ENAMETOOLONG;
     if ((mv = l2s_rename(src, data)) < 0) {
@@ -821,6 +892,70 @@ int cng_l2s_link(const char *src, const char *dst) {
         return (int)sr;
     }
     return 0;
+}
+
+int cng_l2s_link(const char *src, const char *dst) {
+    char st[ST_SIZE];
+    if (l2s_lstat(dst, st) == 0)
+        return -EEXIST; /* link(2): dst must not exist */
+
+    char data[CNG_PATH_MAX], ddir[CNG_PATH_MAX];
+    unsigned long count;
+    unsigned long long ino = 0;
+    l2s_dirname(dst, ddir, sizeof ddir);
+    /* The host's /proc is a place of the guest's, and its symlinks are magic
+     * links, meant to be followed — the descriptor behind /proc/self/fd/N is
+     * how an O_TMPFILE, or any file the guest has no name for, is linked —
+     * not symlinks of the guest's own to copy the text of. */
+    int own = l2s_canonical(src) && l2s_owned(src) &&
+              !(!strncmp(src, "/proc", 5) && (src[5] == '\0' || src[5] == '/'));
+
+    int kind = l2s_link_source(src, own, data, sizeof data, &count, &ino);
+    long lk = -1;
+    if (kind == LSRC_GROUP || kind == LSRC_FILE || kind == -ENOENT) {
+        /* The group's state — the marker, the data's place in the store — is
+         * read, changed and written back, so it is changed under the lock; and
+         * the source is judged again once the lock is held, since the answer
+         * above is only the lock's to confirm. The first link took no lock:
+         * two processes making it at once both saw a plain file, and the
+         * second's rename moved the first's new symlink onto the data file,
+         * which was left a symlink to itself with the contents gone. Under the
+         * lock the second finds the group the first made and joins it. An
+         * ENOENT is confirmed too: between a first link's rename of the file
+         * into the store and the symlink it leaves in its place there is no
+         * such name, which no kernel ever answers for a name that was there
+         * before and is there after. The lock is the group's directory's for
+         * the stand-in (l2s_lock): a file's, for one about to become one. */
+        char hint[CNG_PATH_MAX];
+        cng_strlcpy(hint, kind == LSRC_GROUP ? data : src, sizeof hint);
+        lk = l2s_lock(hint);
+        kind = l2s_link_source(src, own, data, sizeof data, &count, &ino);
+    }
+
+    int r;
+    switch (kind) {
+    case LSRC_GROUP:
+        r = l2s_link_group(data, ino, count, dst, ddir);
+        break;
+    case LSRC_FILE:
+        r = l2s_link_first(src, dst, ino, ddir);
+        break;
+    case LSRC_SYMLINK:
+        r = l2s_link_symlink(src, dst);
+        break;
+    case LSRC_COPY:
+        r = L2S_COPY;
+        break;
+    default:
+        r = kind;
+        break;
+    }
+    l2s_unlock(lk);
+    /* A copy can be as long as the file is, and the lock is the whole rootfs's:
+     * it is made once the lock is let go. It touches no group. */
+    if (r == L2S_COPY)
+        r = l2s_materialize(src, dst);
+    return r;
 }
 
 int cng_l2s_rename_prep(const char *srch, char *absdata, size_t sz) {

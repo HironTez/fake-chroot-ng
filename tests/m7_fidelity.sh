@@ -180,6 +180,13 @@ check_contains "l2s links of the emulation's own file join the group" \
 # listed first, and were all there was once the real marker was gone.
 check_contains "l2s reads a group's count from its own marker only" \
     "l2s-marker: two=1 lost=1 three=1 gone=1 strays=1 -> OK" "$out"
+# link(2) of an ordinary symlink is a second name of the symlink itself. The
+# fallback copied what the symlink pointed at instead, which was an ELOOP (the
+# open does not follow a last component); now a second symlink with the same
+# text is made, and nothing it names is opened. A text in the ".l2s." grammar
+# that was planted from outside is not copied into another directory.
+check_contains "l2s links an ordinary symlink as a second symlink of its text" \
+    "l2s-symlink: rel=1 abs=1 outside=1 dangling=1 read=1 refused=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"

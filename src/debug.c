@@ -4407,6 +4407,83 @@ int cng_cmd_l2stest(int argc, char **argv, char **envp, unsigned long *auxv) {
                 m_two, m_lost, m_three, m_gone, m_strays, ok_m ? "OK" : "FAIL");
     fails += !ok_m;
 
+    /* link(2) of an ordinary symlink is a second name of the symlink itself,
+     * which the emulation makes as a second symlink with the same text: the
+     * copy of what it points at that stood in for it was an ELOOP, since the
+     * open it made does not follow a last component. The text is read as the
+     * kernel's would be from where the new name sits, so nothing it names is
+     * opened — the guest's /etc/hostname here is no file of the rootfs. A
+     * text in the ".l2s." grammar (planted from outside; the guest cannot
+     * write one) is not copied: carried into a directory with a data file by
+     * that name it would join a group it was never counted into. */
+    {
+        long fy = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sy_f",
+                               CNG_O_CREAT | CNG_O_WRONLY, 0644, 0, 0, 0);
+        if (fy >= 0) {
+            sys_write((int)fy, "yy", 2);
+            sys_close((int)fy);
+        }
+        static const char *const syt[4] = {"sy_f", "/w/sy_f", "/etc/hostname",
+                                           "nowhere"};
+        static const char *const syl[4] = {"/w/sy_l0", "/w/sy_l1", "/w/sy_l2",
+                                           "/w/sy_l3"};
+        static const char *const sym[4] = {"/w/sy_m0", "/w/sy_m1", "/w/sy_m2",
+                                           "/w/sy_m3"};
+        int sy_ok[4];
+        for (int i = 0; i < 4; i++) {
+            cng_dispatch(__NR_symlinkat, (long)syt[i], CNG_AT_FDCWD,
+                         (long)syl[i], 0, 0, 0, 0);
+            long lr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)syl[i],
+                                   CNG_AT_FDCWD, (long)sym[i], 0, 0, 0);
+            char txt[64] = {0}, sl[144];
+            long tn = cng_dispatch(__NR_readlinkat, CNG_AT_FDCWD, (long)sym[i],
+                                   (long)txt, sizeof txt - 1, 0, 0, 0);
+            long rl = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)sym[i],
+                                   (long)sl, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+            sy_ok[i] = (lr == 0 && tn == (long)strlen(syt[i]) &&
+                        !strcmp(txt, syt[i]) && rl == 0 &&
+                        (ST_MODE(sl) & 0170000) == 0120000);
+        }
+        /* The first two lead to the file: the new name reads it. */
+        char yb[8] = {0};
+        long yo = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/w/sy_m0",
+                               CNG_O_RDONLY, 0, 0, 0, 0);
+        long yr = -1;
+        if (yo >= 0) {
+            yr = sys_read((int)yo, yb, sizeof yb);
+            sys_close((int)yo);
+        }
+        int sy_read = (yr == 2 && yb[0] == 'y' && yb[1] == 'y');
+        /* A link planted from outside whose text is in the grammar. */
+        char syh[CNG_PATH_MAX];
+        dbg_mkpath(syh, sizeof syh, rootfs, "/w/sy_h", 0, 0);
+        CNG_SYS(__NR_symlinkat, ".l2s.7", CNG_AT_FDCWD, syh, 0, 0, 0);
+        long hr = cng_dispatch(__NR_linkat, CNG_AT_FDCWD, (long)"/w/sy_h",
+                               CNG_AT_FDCWD, (long)"/w/sy_h2", 0, 0, 0);
+        char sh2[144];
+        long hs = cng_dispatch(__NR_newfstatat, CNG_AT_FDCWD, (long)"/w/sy_h2",
+                               (long)sh2, CNG_AT_SYMLINK_NOFOLLOW, 0, 0, 0);
+        int sy_refused = (hr == -EPERM && hs == -ENOENT);
+        int ok_sy = sy_ok[0] && sy_ok[1] && sy_ok[2] && sy_ok[3] && sy_read &&
+                    sy_refused;
+        cng_dprintf(1,
+                    "l2s-symlink: rel=%d abs=%d outside=%d dangling=%d "
+                    "read=%d refused=%d -> %s\n",
+                    sy_ok[0], sy_ok[1], sy_ok[2], sy_ok[3], sy_read,
+                    sy_refused, ok_sy ? "OK" : "FAIL");
+        fails += !ok_sy;
+        for (int i = 0; i < 4; i++) {
+            cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)syl[i], 0, 0, 0, 0,
+                         0);
+            cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)sym[i], 0, 0, 0, 0,
+                         0);
+        }
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/sy_h", 0, 0, 0, 0,
+                     0);
+        cng_dispatch(__NR_unlinkat, CNG_AT_FDCWD, (long)"/w/sy_f", 0, 0, 0, 0,
+                     0);
+    }
+
     cng_blocked[__NR_linkat] = 0;
     cng_g_l2s = 0;
 

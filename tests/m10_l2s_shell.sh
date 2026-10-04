@@ -105,6 +105,19 @@ if [ "$m10_ready" -eq 1 ]; then
         'cd /tmp; cp /bin/busybox f1; ln f1 f2; cmp f1 f2 && echo cmp-ok;
          stat -c %h f2'
 
+    # link(2) of an ordinary symlink is a second name of the symlink itself.
+    # The fallback copied what it pointed at, which was an ELOOP (the open does
+    # not follow a last component); it makes a second symlink of the same text
+    # now, and opens nothing the text names. Link counts of the symlinks are
+    # not printed: the emulation's two symlinks are not one inode.
+    l2s_diff "ln of an ordinary symlink: relative, absolute, dangling, up-and-over" \
+        'cd /tmp; echo hi>f; ln -s f sl; ln sl sl2; readlink sl2; cat sl2;
+         echo abs>g; ln -s /tmp/g as; ln as as2; readlink as2; cat as2;
+         ln -s nowhere dg; ln dg dg2; readlink dg2; mkdir d; ln -s ../f d/s;
+         ln d/s s2; readlink s2;
+         [ -L sl2 ] && [ -L as2 ] && [ -L dg2 ] && [ -L s2 ] && echo all-symlinks;
+         rm sl; cat sl2; rm sl2 as2; ls'
+
     # A group whose data file cannot be opened. The marker update used to be
     # serialized by an flock on the data file itself, opened for reading, so a
     # mode 0000 or 0200 file — which packages do ship — ran the update
@@ -251,6 +264,45 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
     rm -rf "$RD"
 elif [ "$m10_ready" -eq 1 ]; then
     skip "debian leg: no debian rootfs"
+fi
+
+# Legs that need no oracle: an Alpine rootfs, and for the race a guest compiler.
+if [ -n "$M10_ALPINE" ] && [ -x "$M10_ALPINE/bin/busybox" ]; then
+    # A FIFO cannot stand behind a symlink as a regular file does, so the
+    # emulation cannot link one — but it must say so. The fallback copied what
+    # it could not point at by opening the source, and the open of a FIFO for
+    # reading waits for a writer: `ln fifo fifo2` never returned.
+    REM=$(mktemp -d); cp -a "$M10_ALPINE/." "$REM"
+    out=$(run_t 120 -R -l "$REM" /bin/sh -c \
+        'cd /tmp; mkfifo p; ln p p2 2>&1; echo rc=$?; ls' 2>&1)
+    rc=$?
+    check "m10 ln of a FIFO returns instead of waiting for a writer" 0 "$rc"
+    check_contains "m10 ...and is refused as a link the emulation cannot make" \
+        "rc=1" "$out"
+    rm -rf "$REM"
+fi
+
+# The first link of a file, made by many processes at once. It took no lock:
+# a second process saw the plain file the first was moving into the store, and
+# its rename put the first's new symlink on the data file, which was then a
+# symlink to itself — "Symbolic link loop" from every name, the contents gone.
+# 16 processes are released together against each of 40 fresh files; every
+# link must succeed, every name read the contents, and st_nlink be the number
+# of names. Again with a plain file on the store's name, which leaves each group
+# beside its first name and the lock to the directory.
+if [ -n "$M10_ALPINE" ] && [ -x "$M10_ALPINE/bin/busybox" ] &&
+    guest_xlate_ready "l2s first-link race leg" &&
+    guest_cc_report "$CNG_TMP/l2srace" tests/guests/l2srace.c; then
+    for _mode in store per-dir; do
+        REM=$(mktemp -d); cp -a "$M10_ALPINE/." "$REM"
+        cp "$CNG_TMP/l2srace" "$REM/bin/l2srace"
+        [ "$_mode" = per-dir ] && : >"$REM/.l2s"
+        out=$(run_t 300 -R -l "$REM" /bin/sh -c 'cd /tmp; /bin/l2srace 40 16' 2>&1)
+        check_contains "m10 16 processes' first link of one file ($_mode)" \
+            "l2srace rounds=40 procs=16 linkfail=0 unreadable=0 badcount=0 broken=0" \
+            "$out"
+        rm -rf "$REM"
+    done
 fi
 
 unset CNG_L2S_FORCE
