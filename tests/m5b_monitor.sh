@@ -178,6 +178,13 @@ check "...and the host file outside the rootfs is untouched" 600 \
 # that told glibc/systemd the file was missing instead of letting them fall back.
 check_contains "fchmodat2 with AT_EMPTY_PATH is not refused as an empty path" \
     "-> OK" "$(run -t dtest -r "$M5PF/root" fchmodat2 /tmp/d/child 2>&1)"
+# The same under fake root: fake-id papers over a denied mode change, but an
+# ENOSYS from fchmodat2 is a kernel predating it (Linux < 6.6), and faking it to
+# 0 left the mode unchanged with glibc never falling back. A host kernel that has
+# fchmodat2 cannot produce that ENOSYS, so there this only checks the success leg.
+chmod 600 "$M5PF/root/tmp/d/child"
+check_contains "fchmodat2 under --fake-id 0:0 applies the mode or passes ENOSYS on" \
+    "-> OK" "$(run -u 0:0 -t dtest -r "$M5PF/root" fchmodat2 /tmp/d/child 2>&1)"
 rm -rf "$M5PF"
 
 # CNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
