@@ -1718,7 +1718,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         long ro = ro_refusal(p, deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
-        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
+        /* ENOSYS here is a kernel predating the call (Linux < 6.6), not a
+         * denied mode change: glibc and systemd fall back to fchmodat (or
+         * chmod of /proc/self/fd/N) on it. chattr_result's fake-root success
+         * would swallow that and leave the mode silently unchanged. */
+        long r = reissue(a0, (long)p, a2, a3, a4, a5, nr);
+        return r == -ENOSYS ? r : chattr_result(r);
     }
 #endif
 
