@@ -355,6 +355,125 @@ int cng_cmd_dtest(int argc, char **argv, char **envp, unsigned long *auxv) {
                     ok ? "OK" : "FAIL");
         return ok ? 0 : 1;
     }
+    /* _dtest -r ROOT procfdesc GUESTDIR — GUESTDIR holds a file `child` and a
+     * symlink `escape` whose absolute target is a HOST file outside ROOT.
+     * Components below a /proc fd link used to ride along to the kernel, which
+     * walked them from the fd's real directory with no rootfs: `escape` was
+     * then followed from the HOST root, and chmod through
+     * /proc/<pid>/fd/<dirfd>/escape changed the host file. Every spelling of
+     * the link (self, numeric pid, /dev/fd, and relative to /proc/self/fd and
+     * /proc/self dirfds) must reach `child` and must not reach `escape`. The
+     * caller checks the host file afterwards too. */
+    if (!strcmp(op, "procfdesc")) {
+        long d = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                              CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (d < 0) {
+            cng_dprintf(1, "procfdesc: dir errno %d\n", (int)-d);
+            return 1;
+        }
+        int ok = 1;
+        char p[256];
+        const char *const alias[] = {"self", "numeric", "dev"};
+        const char *const leaf[] = {"child", "escape"};
+        for (int a = 0; a < 3; a++) {
+            long r[3];
+            for (int l = 0; l < 2; l++) {
+                if (a == 0)
+                    cng_snprintf(p, sizeof p, "/proc/self/fd/%d/%s", (int)d,
+                                 leaf[l]);
+                else if (a == 1)
+                    cng_snprintf(p, sizeof p, "/proc/%d/fd/%d/%s",
+                                 (int)sys_getpid(), (int)d, leaf[l]);
+                else
+                    cng_snprintf(p, sizeof p, "/dev/fd/%d/%s", (int)d, leaf[l]);
+                r[l] = cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)p, 0644,
+                                    0, 0, 0, 0);
+            }
+            r[2] = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)p,
+                                CNG_O_RDONLY, 0, 0, 0, 0);
+            if (r[2] >= 0)
+                sys_close((int)r[2]);
+            ok &= r[0] == 0 && r[1] == -ENOENT && r[2] == -ENOENT;
+            cng_dprintf(1, "procfdesc %s: child=%d escape_chmod=%d "
+                           "escape_open=%d\n",
+                        alias[a], (int)r[0], (int)r[1], (int)r[2]);
+        }
+        /* ".." below the link must clamp at the guest root, not climb out of
+         * it from the fd's real directory. */
+        cng_snprintf(p, sizeof p, "/proc/self/fd/%d/../../../../../..%s",
+                     (int)d, gpath);
+        long up = cng_dispatch(__NR_fchmodat, CNG_AT_FDCWD, (long)p, 0755, 0, 0,
+                               0, 0);
+        /* Relative to a /proc dirfd: the same remainder, the same answer. */
+        long fdd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/self/fd",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        long psd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)"/proc/self",
+                                CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        cng_snprintf(p, sizeof p, "%d/child", (int)d);
+        long rel_child = cng_dispatch(__NR_fchmodat, fdd, (long)p, 0644, 0, 0, 0,
+                                      0);
+        cng_snprintf(p, sizeof p, "%d/escape", (int)d);
+        long rel_esc = cng_dispatch(__NR_fchmodat, fdd, (long)p, 0644, 0, 0, 0,
+                                    0);
+        cng_snprintf(p, sizeof p, "fd/%d/escape", (int)d);
+        long self_esc = cng_dispatch(__NR_fchmodat, psd, (long)p, 0644, 0, 0, 0,
+                                     0);
+        /* No path behind a pipe, so nothing below it — as on the kernel. */
+        int pfd[2] = {-1, -1};
+        long pipe_child = 1;
+        if (CNG_SYS(__NR_pipe2, (long)pfd, 0, 0, 0, 0, 0) == 0) {
+            cng_snprintf(p, sizeof p, "/proc/self/fd/%d/x", pfd[0]);
+            pipe_child = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)p,
+                                      CNG_O_RDONLY, 0, 0, 0, 0);
+            if (pipe_child >= 0)
+                sys_close((int)pipe_child);
+            sys_close(pfd[0]);
+            sys_close(pfd[1]);
+        }
+        /* The link itself, as the final component, still reopens the fd. */
+        cng_snprintf(p, sizeof p, "/proc/self/fd/%d", (int)d);
+        long reopen = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)p,
+                                   CNG_O_RDONLY | CNG_O_DIRECTORY, 0, 0, 0, 0);
+        if (reopen >= 0)
+            sys_close((int)reopen);
+        if (fdd >= 0)
+            sys_close((int)fdd);
+        if (psd >= 0)
+            sys_close((int)psd);
+        sys_close((int)d);
+        ok &= up == 0 && fdd >= 0 && psd >= 0 && rel_child == 0 &&
+              rel_esc == -ENOENT && self_esc == -ENOENT &&
+              (pipe_child == -ENOTDIR || pipe_child == -ENOENT) && reopen >= 0;
+        cng_dprintf(1, "procfdesc: dotdot=%d rel_child=%d rel_escape=%d "
+                       "self_escape=%d pipe_child=%d reopen=%d -> %s\n",
+                    (int)up, (int)rel_child, (int)rel_esc, (int)self_esc,
+                    (int)pipe_child, reopen >= 0, ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    /* _dtest -r ROOT fchmodat2 GUESTFILE — fchmodat2(fd, "", mode,
+     * AT_EMPTY_PATH) names the fd itself. It must reach the kernel (success,
+     * or ENOSYS before Linux 6.6) rather than be refused as an empty path:
+     * ENOENT told glibc and systemd the file was missing, so they never fell
+     * back to the /proc/self/fd/N spelling of fchmodat. */
+    if (!strcmp(op, "fchmodat2")) {
+        long fd = cng_dispatch(__NR_openat, CNG_AT_FDCWD, (long)gpath,
+                               CNG_O_RDONLY, 0, 0, 0, 0);
+        if (fd < 0) {
+            cng_dprintf(1, "fchmodat2: open errno %d\n", (int)-fd);
+            return 1;
+        }
+        long r = cng_dispatch(452 /* __NR_fchmodat2 */, fd, (long)"", 0640,
+                              CNG_AT_EMPTY_PATH, 0, 0, 0);
+        char st[144];
+        unsigned m = 0;
+        if (CNG_SYS(__NR_fstat, fd, (long)st, 0, 0, 0, 0) == 0)
+            m = *(unsigned *)(st + 16) & 07777; /* st_mode, AArch64 layout */
+        sys_close((int)fd);
+        int ok = (r == 0 && m == 0640) || r == -ENOSYS;
+        cng_dprintf(1, "fchmodat2: rc=%d mode=%o -> %s\n", (int)r, m,
+                    ok ? "OK" : "FAIL");
+        return ok ? 0 : 1;
+    }
     if (!strcmp(op, "inotify")) {
         long ifd = CNG_SYS(__NR_inotify_init1, 0, 0, 0, 0, 0, 0);
         if (ifd < 0) {

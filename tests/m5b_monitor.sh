@@ -154,6 +154,32 @@ check_contains "dispatch openat through /proc/self/cwd" \
     "read: HELLO-FROM-ROOTFS" \
     "$(run -t dtest -r "$ROOT" open /proc/self/cwd/etc/greeting 2>&1)"
 
+# ...but only the link itself is a host path. Components BELOW an fd link (a
+# directory fd) used to ride along to the kernel, which walked them from the
+# real directory with no rootfs: an absolute symlink there resolved from the
+# HOST root, so chmod("/proc/<pid>/fd/<dirfd>/escape") changed a host file
+# outside the rootfs (seen on Android through systemd's fchmodat fallback). The
+# target is a real host file, so a regression also shows up as its mode.
+M5PF=$(mktemp -d)
+mkdir -p "$M5PF/root/tmp/d"
+printf 'outside guest root\n' > "$M5PF/host-sentinel"
+chmod 600 "$M5PF/host-sentinel"
+: > "$M5PF/root/tmp/d/child"
+chmod 600 "$M5PF/root/tmp/d/child"
+ln -s "$M5PF/host-sentinel" "$M5PF/root/tmp/d/escape"
+out=$(run -t dtest -r "$M5PF/root" procfdesc /tmp/d 2>&1)
+check_contains "a /proc fd link's remainder stays inside the rootfs" \
+    "procfdesc: dotdot=0 rel_child=0 rel_escape=-2 self_escape=-2" "$out"
+check_contains "...through every spelling of the link" "-> OK" "$out"
+check "...and the host file outside the rootfs is untouched" 600 \
+    "$(stat -c %a "$M5PF/host-sentinel" 2>/dev/null)"
+# fchmodat2(fd, "", mode, AT_EMPTY_PATH) names the fd: it must reach the kernel
+# (or come back ENOSYS before Linux 6.6), never ENOENT for an "empty path" —
+# that told glibc/systemd the file was missing instead of letting them fall back.
+check_contains "fchmodat2 with AT_EMPTY_PATH is not refused as an empty path" \
+    "-> OK" "$(run -t dtest -r "$M5PF/root" fchmodat2 /tmp/d/child 2>&1)"
+rm -rf "$M5PF"
+
 # CNG_DEBUG error logging must not read a scalar syscall arg as a path pointer:
 # truncate's length is large enough to look like one, and dereferencing it is a
 # wild read inside the handler (SIGSEGV masked there => the guest is killed).

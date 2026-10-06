@@ -351,6 +351,18 @@ vfork/`posix_spawn` child-stack handling.
   Accepted divergences: `/proc/self/fd/N` resolves even when the guest has no
   `/proc` mounted, where a real chroot would report ENOENT. (`readlink`ing one
   used to report the host path; M11 maps it back to the guest view.)
+  Containment fix (later): "resolves to itself" holds for the link as the
+  **final** component only. Components below it used to ride along to the
+  kernel, which walked them from the fd's real directory with no rootfs, so
+  `chmod /proc/<pid>/fd/<dirfd>/escape` followed an absolute `escape` symlink
+  from the HOST root and changed a host file (found on Android 17 through
+  systemd's fchmodat fallback). The walk now follows a non-final fd link to the
+  guest path of its target (host target mapped back through the rootfs/binds,
+  `/proc`, `/dev`), a `/proc` dirfd is walked like any other, and an fd outside
+  the guest view has no reachable children (ENOENT). `fchmodat2(fd, "",
+  AT_EMPTY_PATH)` is no longer refused as an empty path (it was ENOENT; it now
+  reaches the kernel, which answers or says ENOSYS before 6.6). Regression:
+  `m5b` `procfdesc`/`fchmodat2` dtests plus a host-file mode check.
 
 - [x] **CNG_DEBUG must not change behaviour (wild read in the error log)**
   `dbg_path` picked the path to log by testing whether `a0`/`a1` "looks like a

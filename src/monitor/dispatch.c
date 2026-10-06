@@ -239,8 +239,10 @@ static int proc_magic(char *cur, size_t sz) {
 
     /* "fd[/<n>]": the magic path *is* the host path — the kernel takes it
      * straight to the open file description, including the anonymous and
-     * deleted files no re-rooted target could ever name. Any trailing
-     * components (a directory fd) ride along, as they do for a real dirfd.
+     * deleted files no re-rooted target could ever name. That holds for the
+     * link as the FINAL component only: cng_resolve walks anything below it
+     * (a directory fd's children) from the fd's guest path instead, since the
+     * kernel would resolve those with no rootfs in the way.
      *
      * The directory itself counts, and not only for symmetry: it used to fall
      * through to cng_fs_translate, which answered it out of the /proc zone —
@@ -534,6 +536,48 @@ static int splice_rest(char *rest, size_t sz, const char *tgt,
     return cng_strlcpy(rest, tmp, sz) < sz ? 0 : -1;
 }
 
+/* What a /proc fd link leads to, for walking components below it. */
+#define FD_LINK_GUEST 0 /* `out` is the guest path of the fd's target */
+#define FD_LINK_PASS  1 /* no path behind it (pipe, socket, closed fd) */
+#define FD_LINK_NONE  2 /* a host path outside the guest view */
+
+/* Read the fd link `magic` ("/proc/<pid|self|thread-self>/fd/<n>", which is a
+ * host path too: the /proc zone passes through) and map its target back to the
+ * guest path naming the same object — the rootfs/bind map in reverse, plus the
+ * two passthrough zones, whose host and guest spellings coincide. Returns one of
+ * FD_LINK_*, or -1 when the guest spelling does not fit `sz`. */
+static int fd_link_guest(const char *magic, char *out, size_t sz) {
+    char host[CNG_PATH_MAX];
+    long n = sys_readlinkat(CNG_AT_FDCWD, magic, host, sizeof host - 1);
+    if (n <= 0 || host[0] != '/')
+        return FD_LINK_PASS; /* closed (the kernel's own ENOENT) or anonymous */
+    if ((size_t)n >= sizeof host - 1)
+        return -1;
+    host[n] = '\0';
+    if (cng_fs_untranslate(cng_g_fs, host, out, sz) == 0)
+        return FD_LINK_GUEST;
+    if (!cng_g_no_proc && strncmp(host, "/proc", 5) == 0 &&
+        (host[5] == '\0' || host[5] == '/'))
+        return cng_strlcpy(out, host, sz) < sz ? FD_LINK_GUEST : -1;
+    if (!cng_g_no_dev && strncmp(host, "/dev/", 5) == 0) {
+        for (int i = 0; i < cng_dev_nnodes; i++) {
+            const char *h = cng_dev_nodes[i].host;
+            size_t hl = strlen(h);
+            if (strncmp(h, "/dev/", 5) != 0 || strncmp(host, h, hl) != 0 ||
+                (host[hl] != '\0' && host[hl] != '/'))
+                continue;
+            size_t k = cng_strlcpy(out, "/dev/", sz);
+            if (cng_strlcpy(out + k, cng_dev_nodes[i].name, sz - k) >= sz - k)
+                return -1;
+            k = strlen(out);
+            return cng_strlcpy(out + k, host + hl, sz - k) < sz - k
+                       ? FD_LINK_GUEST
+                       : -1;
+        }
+    }
+    return FD_LINK_NONE;
+}
+
 /* Resolve a guest path to a host path, following symlinks *within the guest*:
  * an absolute symlink target is re-rooted into the rootfs rather than resolved
  * against the host root (which is what breaks Alpine's busybox symlinks).
@@ -596,9 +640,51 @@ int cng_resolve(const char *path, int deref_final, char *out, size_t outsz) {
          * path at all ("pipe:[12345]"). */
         dev_magic(canon, sizeof canon);
         int magic = proc_magic(canon, sizeof canon);
+        if (magic == PROC_MAGIC_HOST && !last) {
+            /* Components remain below the fd table or one of its links, and
+             * they must NOT ride along to the kernel: it would walk them from
+             * the fd's real host directory with no rootfs in the way, so an
+             * absolute symlink there resolved from the HOST root — chmod of
+             * "/proc/<pid>/fd/<dirfd>/escape", escape -> /a/host/file, changed
+             * that host file — and ".." climbed straight out of the rootfs.
+             *
+             * The table itself is a plain directory: keep walking, and the next
+             * component is classified as an fd link in turn. An fd link is
+             * followed like any symlink, but to the GUEST spelling of what the
+             * fd names (its host target mapped back), so everything after it is
+             * contained the way the rest of the walk is. Only as the final
+             * component does the magic path pass through, which is what the
+             * kernel's own reopen of the fd (anonymous files included) needs. */
+            size_t cl = strlen(canon);
+            if (cl >= 3 && strcmp(canon + cl - 3, "/fd") == 0)
+                continue;
+            char tgt[CNG_PATH_MAX];
+            int t = fd_link_guest(canon, tgt, sizeof tgt);
+            if (t < 0)
+                return -ENAMETOOLONG;
+            if (t == FD_LINK_NONE) {
+                /* Nothing below a host object outside the guest view can be
+                 * named from inside it. /proc/0 never exists (the hidden-process
+                 * view relies on the same), so the kernel answers ENOENT. */
+                cng_strlcpy(out, "/proc/0", outsz);
+                return 0;
+            }
+            if (t == FD_LINK_GUEST) {
+                if (++nlinks > 40)
+                    return -ELOOP;
+                if (splice_rest(rest, sizeof rest, tgt, p) < 0)
+                    return -ENAMETOOLONG;
+                p = rest;
+                cng_strlcpy(canon, "/", sizeof canon);
+                continue;
+            }
+            /* FD_LINK_PASS: a closed fd or an anonymous object (pipe:[N],
+             * anon_inode:...) has no children, so the kernel can only refuse
+             * whatever follows it — ENOENT or ENOTDIR, as it would natively. */
+        }
         if (magic == PROC_MAGIC_HOST) {
-            /* The magic path IS the host path. Any components left ride along,
-             * as they do for a real dirfd. */
+            /* The magic path IS the host path, and the kernel takes it straight
+             * to the open file description. */
             size_t n = cng_strlcpy(out, canon, outsz);
             if (n >= outsz || cng_strlcpy(out + n, p, outsz - n) >= outsz - n)
                 return -ENAMETOOLONG;
@@ -688,15 +774,25 @@ static int dirfd_host(int dfd, char *hdir, size_t sz) {
  *
  * `out` comes back an absolute host path. Callers reissue with the original
  * dirfd, which the kernel ignores for an absolute path, so no caller changes.
- * Returns -1 when the dirfd names a directory outside the guest view (a /proc
- * dirfd, say) — there is no guest path to express it as, and the /proc zone
- * wants the host namespace anyway, so the caller passes the name through. */
+ * Returns -1 when the dirfd names a directory outside the guest view — there is
+ * no guest path to express it as, so the caller passes the name through. A
+ * /proc dirfd is not that: the passthrough zone is spelled the same on both
+ * sides, so it is walked like the rest (see below). */
 static int xlate_at(int dfd, const char *path, char *out, size_t sz, int deref) {
     char hdir[CNG_PATH_MAX], gdir[CNG_PATH_MAX], gp[CNG_PATH_MAX];
     if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
         return -1;
-    if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sizeof gdir) != 0)
-        return -1;
+    if (cng_fs_untranslate(cng_g_fs, hdir, gdir, sizeof gdir) != 0) {
+        /* A directory in the /proc passthrough is spelled the same in both
+         * namespaces, and it has to be walked like any other: the names below
+         * it include the fd links, whose remainder ("<n>/escape" against a
+         * /proc/self/fd dirfd) the kernel would otherwise follow from the HOST
+         * root. The walk also applies the hidden-process view. */
+        if (cng_g_no_proc || strncmp(hdir, "/proc", 5) != 0 ||
+            (hdir[5] != '\0' && hdir[5] != '/'))
+            return -1;
+        cng_strlcpy(gdir, hdir, sizeof gdir);
+    }
     size_t k = cng_strlcpy(gp, gdir, sizeof gp);
     if (k >= sizeof gp)
         return XLATE_AT_LONG;
@@ -1259,6 +1355,15 @@ static int empty_path_ok(long nr, long a0, long a2, long a3, long a4) {
         return ((int)a4 & CNG_AT_EMPTY_PATH) != 0;
 #ifdef __NR_faccessat2
     case __NR_faccessat2:
+        return ((int)a3 & CNG_AT_EMPTY_PATH) != 0;
+#endif
+#ifdef __NR_fchmodat2
+    /* fchmodat2(fd, "", mode, AT_EMPTY_PATH) is the call glibc's fchmodat and
+     * systemd try first; refusing it ENOENT made them believe the FILE was
+     * missing instead of falling back. Passed through, the kernel answers it,
+     * or says ENOSYS where it predates the call (Linux < 6.6), which is the
+     * answer every caller already has a fallback for. */
+    case __NR_fchmodat2:
         return ((int)a3 & CNG_AT_EMPTY_PATH) != 0;
 #endif
 #ifdef __NR_name_to_handle_at
